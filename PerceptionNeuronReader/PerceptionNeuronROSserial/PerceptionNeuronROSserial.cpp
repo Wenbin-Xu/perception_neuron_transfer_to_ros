@@ -1,0 +1,250 @@
+// PerceptionNeuronROSserial.cpp : Defines the entry point for the console application.
+//
+/* How to use the file:
+You need to include many things.
+For the "Additional include directory"(¸½¼Ó°üº¬Ä¿Â¼)£¬ include the header files which are not with the source files and the ros_lib generated and modified.
+Also you need to include "NeuronDataReader.lib" whose version corresponds to the version of the software.
+Additionally, you need to include duration.cpp,windowssocket.cpp,windowssocket.h,NeuronDataReader.lib and you need to put NeuronDataReader.dll under the file "Debug".
+
+*/
+
+
+
+#include "stdafx.h"
+#include "ros.h"
+#include <Windows.h>
+#include <geometry_msgs\Pose.h>
+#include <std_msgs\Float32MultiArray.h>
+#include <std_msgs\MultiArrayLayout.h>
+#include <std_msgs\MultiArrayDimension.h>
+#include <std_msgs\Int32MultiArray.h>
+#include <std_msgs\String.h>
+#include <string>
+#include <stdlib.h>
+#include <sstream>
+#include <stdexcept>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <typeinfo>
+#include "WindowsSocket.h"
+#include <stdio.h>
+#include "NeuronDataReader.h"
+#include "SocketCommand.h"
+
+#include<time.h>
+
+SOCKET_REF sockTCPREF = NULL;
+FrameDataReceived _DataReceived;
+CalculationDataReceived _CmdDataReceived;
+BvhDataHeader     _bvhHeader;
+SocketStatusChanged    _SocketStatusChanged;
+
+
+
+float * _valuesBuffer = NULL;
+int _frameCount = 0;
+int bufferLength = 0;
+bool bCallbacks = false;
+double rate = 20;
+double sleeptime = 1e3 / rate;
+
+long start = clock();
+long end, period;
+// Max Array Length for ROS Data = 255  should be for UINT8 (-> data_msg.data_length )
+// But not working maybe they used somewhere signed int8
+// -> therefore the max array length = 127.
+
+// But it can be adjusted by modifying both files on windows and ubuntu.
+//On windows, users need to change something in the Nodehandler.h
+//On ubuntu, users need to make some changes in both Nodehandler.h and session.h
+//session.h is the head file of one of rosserial pkg which needs to be installed by binary.
+
+struct MyCallbacks {
+
+	static void __stdcall bvhDataReceived(void * customObject, SOCKET_REF sockRef, BvhDataHeader* header, float * data)
+	{
+		//you may use these codes to detect the frequency.
+		//end = clock();
+		//period = end - start;
+		//start = end;
+		//printf("data frequency=%f\n", 1e3/ period);
+		BvhDataHeader * ptr = header;
+		if (ptr->DataCount != bufferLength || _valuesBuffer == NULL) {
+			_valuesBuffer = new float[ptr->DataCount];
+			bufferLength = ptr->DataCount;
+		}
+		
+		//printf("start=%X\n", ptr->Token1);
+		//printf("end=%X\n", ptr->Token2);
+		//printf("datacount=%d\n", ptr->DataCount);
+		//printf("withdisp=%d\n", ptr->WithDisp);
+		//printf("withreference=%d\n", ptr->WithReference);
+		//printf("frameindex=%u\n", ptr->FrameIndex);
+		//printf("AvatarIndex=%u\n", ptr->AvatarIndex);
+		//printf("Avatarname=%u\n", ptr->AvatarIndex);
+
+		memcpy((char *)_valuesBuffer, (char*)data, (int)ptr->DataCount * sizeof(float));
+
+	}
+	static void __stdcall calculationDataReceived(void* customedObj, SOCKET_REF sockRef, CalcDataHeader* header, float* data) {
+		printf("Data received!! \n");
+	}
+
+	static void __stdcall socketStatusChanged(void * customObject, SOCKET_REF sockRef, SocketStatus status, char * message) {
+		printf("Socket status changed\n");
+
+	}
+
+
+	virtual void registerNeuronCallbacks() {
+		bool bBVH = false;
+		bool bCmd = false;
+		bool bSSt = false;
+
+
+		BRRegisterFrameDataCallback(this, bvhDataReceived);
+
+		BRRegisterCalculationDataCallback(this, calculationDataReceived);
+
+		BRRegisterSocketStatusCallback(this, socketStatusChanged);
+
+		printf("Register Neuron Callbacks");
+	}
+
+
+};
+
+MyCallbacks cbks;
+
+
+
+
+
+void prepareDataMsg(std_msgs::Float32MultiArray & data_msg) {
+	data_msg.layout.dim = (std_msgs::MultiArrayDimension *) malloc(sizeof(std_msgs::MultiArrayDimension) * 2);
+	data_msg.layout.dim[0].label = "PerceptionNeuronData";
+	data_msg.layout.dim[0].size = 180;
+	// adapted ros_lib/ros/node_handle.h buffer limitations to 1024 (max would be 2048)
+	data_msg.data_length = 180;
+	data_msg.layout.data_offset = 0;
+	data_msg.data = (float *)malloc(sizeof(float) * 500);
+}
+
+int main(int argc, _TCHAR * argv[])
+{
+
+	// first set some default values if no config file found
+	std::string ipAxisNeuron = "192.168.1.5";
+	std::string ipROS = "192.168.1.4";
+	int portAxisNeuron = 7001;
+	bool verbose = true;
+
+	// read config file
+	std::ifstream fin("config.txt", std::ios::in);
+	std::string line;
+	std::istringstream iss;
+	if (fin.is_open())
+	{
+		printf("Reading values from config.txt\n");
+		while (fin.good())
+		{
+			std::getline(fin, line);
+			iss.str(line.substr(line.find("=") + 1));
+			if (line.find("ipAxisNeuron") != std::string::npos) {
+				printf("IP Axis Neuron %s \n", iss.str().c_str());
+				iss >> ipAxisNeuron;
+
+			}
+			else if (line.find("portAxisNeuron") != std::string::npos) {
+				printf("Port Axis Neuron %s \n", iss.str().c_str());
+				iss >> portAxisNeuron;
+			}
+			else if (line.find("ipROS") != std::string::npos) {
+				printf("IP ROS Serial Server %s \n", iss.str().c_str());
+				iss >> ipROS;
+			}
+			iss.clear();
+		}
+		fin.close();
+	}
+	else
+	{
+		printf("Unable to open config.txt file.. using DEFAULT values. \n");
+		printf("ROS Master (Serial Windwos): 192.168.1.4, Axis Neuron 192.168.1.5. \n");
+		printf("The config file will be read if use the commandline \n");
+		printf("  cd to PerceptionNeuronROSSerial path, start PerceptionNeuronROSserial.exe .. \n");
+	}
+
+	// ROS Handle
+	ros::NodeHandle nh;
+	char *ros_master = new char[ipROS.length() + 1];
+	strcpy(ros_master, ipROS.c_str());
+
+	printf("\nConnecting to ROS Master (ROS Serial Server) at %s \n", ros_master);
+	nh.initNode(ros_master);
+	// Neuron Connection
+	void * neuronptr = NULL;
+	if (BRGetSocketStatus(neuronptr) == SocketStatus::CS_Running) {
+		BRCloseSocket(neuronptr);
+	}
+
+
+	printf("Okay, we after the if SocketStatus::CS_Running\n");
+
+	char *nIP = new char[ipAxisNeuron.length() + 1];
+	strcpy(nIP, ipAxisNeuron.c_str());
+
+	printf("Okay, calluing BRConnectTo IP: %s port %d\n", nIP, portAxisNeuron);
+
+
+	neuronptr = BRConnectTo(nIP, portAxisNeuron);
+	if (neuronptr == NULL) {
+		printf("Axis Neuron Connection refused! \n ");
+		printf("Trying again... \n");
+		//return 0;
+	}
+	else {
+		printf("Connected to Axis Neuron at %s \n", nIP);
+	}
+
+
+
+	cbks.registerNeuronCallbacks();
+
+	printf("\n \nAdvertising Axis Neuron Data to ROS Serial Server\n");
+
+	// Prepare the data msg arrays for the ros publisher
+
+
+	std_msgs::Float32MultiArray data_msg_1;
+	prepareDataMsg(data_msg_1);
+
+
+
+	ros::Publisher data_pub_1("/perception_neuron/data_1", &data_msg_1);
+
+	nh.advertise(data_pub_1);
+	
+	while (1)
+	{
+
+		if (verbose) {
+		printf("Current Data Frame %i \n", _frameCount);
+		}
+
+		if (_valuesBuffer != NULL) {
+
+			data_msg_1.data = _valuesBuffer;
+
+			data_pub_1.publish(&data_msg_1);
+		
+		}
+
+		nh.spinOnce();
+		Sleep(sleeptime);
+	}
+	BRCloseSocket(neuronptr);
+	printf("All done!\n");
+	return 0;
+}

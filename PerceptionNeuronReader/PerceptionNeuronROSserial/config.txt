@@ -1,0 +1,3 @@
+ipROS=192.168.191.2
+ipAxisNeuron=192.168.191.1
+portAxisNeuron=7001
